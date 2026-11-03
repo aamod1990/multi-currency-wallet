@@ -1,0 +1,67 @@
+# Local stack:            docker compose up --build        -> http://localhost:8000
+# With monitoring:        docker compose --profile monitoring up --build
+#                         Prometheus http://localhost:9090, Grafana http://localhost:3000 (admin/admin)
+services:
+  db:
+    image: public.ecr.aws/docker/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "${DB_PORT:-5432}:5432"
+
+  app:
+    build: .
+    image: multi-currency-wallet:local
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://wallet:wallet@db:5432/wallet
+      ENVIRONMENT: local
+      JWT_SECRET: ${JWT_SECRET:-local-dev-secret-change-me-0123456789abcdef}
+      FX_PROVIDER: ${FX_PROVIDER:-live}
+      FX_REFRESH_INTERVAL_SECONDS: ${FX_REFRESH_INTERVAL_SECONDS:-3600}
+      CORS_ORIGINS: http://localhost:5173
+      LOG_LEVEL: INFO
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  prometheus:
+    image: quay.io/prometheus/prometheus:v2.55.1
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+    ports:
+      - "9090:9090"
+    depends_on: [app]
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    profiles: [monitoring]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+
+volumes:
+  pgdata:
