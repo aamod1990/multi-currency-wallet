@@ -18,7 +18,7 @@ from app.core.error_monitor import ErrorRateMonitor, MonitorConfig
 from app.core.errors import AppError
 from app.core.logging import configure_logging, request_id_ctx
 from app.core.middleware import install_observability
-from app.db.session import session_factory
+from app.db.mongo import ensure_schema, get_database
 from app.fx.factory import build_provider
 from app.services.fx_refresher import FxRefresher
 
@@ -76,9 +76,10 @@ def create_app(settings: Settings | None = None, *, start_background: bool = Tru
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         refresher = None
+        ensure_schema(get_database())
         if start_background and settings.fx_refresh_enabled:
             refresher = FxRefresher(
-                build_provider(settings), session_factory(), settings.fx_refresh_interval_seconds
+                build_provider(settings), get_database, settings.fx_refresh_interval_seconds
             )
             refresher.start()
         log.info(

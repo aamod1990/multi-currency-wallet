@@ -5,9 +5,7 @@ Summary: Multi-Currency Wallet Platform API
 Requires-Python: >=3.12
 Requires-Dist: fastapi==0.115.6
 Requires-Dist: uvicorn[standard]==0.32.1
-Requires-Dist: sqlalchemy==2.0.36
-Requires-Dist: psycopg[binary]==3.2.3
-Requires-Dist: alembic==1.14.0
+Requires-Dist: pymongo==4.10.1
 Requires-Dist: pydantic[email]==2.10.3
 Requires-Dist: pydantic-settings==2.6.1
 Requires-Dist: pyjwt==2.10.1

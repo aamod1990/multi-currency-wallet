@@ -49,7 +49,6 @@ def list_wallets(user: CurrentUser, db: DB) -> WalletList:
 @router.post("", response_model=WalletOut, status_code=status.HTTP_201_CREATED)
 def create_wallet(body: CreateWalletRequest, user: CurrentUser, db: DB) -> WalletOut:
     wallet = wallet_service.get_or_create_wallet(db, user.id, body.currency)
-    db.commit()
     return WalletOut.model_validate(wallet)
 
 

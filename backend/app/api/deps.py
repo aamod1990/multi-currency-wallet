@@ -3,16 +3,16 @@ from typing import Annotated
 
 from fastapi import Depends, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
 
 from app.core.errors import Unauthorized, ValidationFailed
 from app.core.logging import user_id_ctx
 from app.core.security import decode_access_token
 from app.db.models import User
-from app.db.session import get_db
+from app.db.mongo import Db, get_db
+from app.db.repository import get_user
 
 bearer = HTTPBearer(auto_error=False)
-DB = Annotated[Session, Depends(get_db)]
+DB = Annotated[Db, Depends(get_db)]
 
 
 def get_current_user(
@@ -23,7 +23,7 @@ def get_current_user(
     if creds is None or creds.scheme.lower() != "bearer":
         raise Unauthorized("Not authenticated")
     user_id: uuid.UUID = decode_access_token(creds.credentials)
-    user = db.get(User, user_id)
+    user = get_user(db, user_id)
     if user is None:
         raise Unauthorized("User no longer exists")
     user_id_ctx.set(str(user.id))

@@ -9,8 +9,8 @@ The project was built with **Devin** (Cognition's autonomous coding agent) worki
 | Area | AI contribution | Human-style judgement applied / verified by |
 |---|---|---|
 | Architecture | Proposed the modular monolith, ledger + materialized balance, row-lock strategy, FX snapshot model | Decisions and trade-offs documented in ARCHITECTURE.md; each backed by a test |
-| Backend code | Generated FastAPI routers, services, SQLAlchemy models, Alembic migration | Ruff (strict rule set incl. bandit `S`), mypy, 81 unit + integration tests against real Postgres |
-| Concurrency | Wrote lock ordering and idempotency race handling, then the threaded tests that try to break them | Tests run concurrent overdrafts, bidirectional transfer storms, concurrent key reuse |
+| Backend code | Generated FastAPI routers, services, MongoDB document models, schema/index setup | Ruff (strict rule set incl. bandit `S`), mypy, 86 unit + integration tests against a real MongoDB replica set |
+| Concurrency | Wrote transactional conditional updates and idempotency race handling (originally on PostgreSQL row locks, later ported to MongoDB transactions on request), then the threaded tests that try to break them | Tests run concurrent overdrafts, bidirectional transfer storms, concurrent key reuse |
 | FX integration | Implemented provider adapters and fallback chain | Unit tests with mocked HTTP (respx) for success, malformed payloads, failover; manual check of live endpoints |
 | Frontend | Generated React pages, API client, validation | `tsc`, oxlint, vitest tests; manual run against the API |
 | Infra / CI | Dockerfile, compose, Prometheus rules, Grafana dashboard, GitHub Actions, Render blueprint | `docker compose up --wait` + smoke test script; `promtool check config/rules` |

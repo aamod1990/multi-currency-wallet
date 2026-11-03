@@ -2,7 +2,6 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
 
 from app.api.deps import DB
 from app.core.config import get_settings
@@ -24,7 +23,7 @@ def ready(request: Request, db: DB) -> JSONResponse:
     checks: dict[str, dict[str, object]] = {}
     healthy = True
     try:
-        db.execute(text("SELECT 1"))
+        db.command("ping")
         checks["database"] = {"status": "ok"}
     except Exception as exc:
         healthy = False

@@ -78,15 +78,15 @@ def test_fx_quote_and_currencies(client, make_user):
 
 
 def test_refresher_skips_when_fresh_and_respects_force(db):
-    from app.db.session import session_factory
+    from app.db.mongo import get_database
 
-    r = FxRefresher(StaticProvider(), session_factory(), interval_seconds=3600)
+    r = FxRefresher(StaticProvider(), get_database, interval_seconds=3600)
     assert r.run_once() is False  # snapshot seeded by fixture is fresh
     assert r.run_once(force=True) is True
 
 
 def test_refresher_propagates_provider_failure(db):
-    from app.db.session import session_factory
+    from app.db.mongo import get_database
 
     class Broken:
         name = "broken"
@@ -94,12 +94,24 @@ def test_refresher_propagates_provider_failure(db):
         def fetch(self, base):
             raise FxProviderError("down")
 
-    r = FxRefresher(Broken(), session_factory(), interval_seconds=3600)
+    r = FxRefresher(Broken(), get_database, interval_seconds=3600)
     try:
         r.run_once(force=True)
         raise AssertionError("expected failure")
     except FxProviderError:
         pass
+
+
+def test_refresher_lease_excludes_concurrent_instances(db):
+    from app.services.fx_refresher import acquire_lease, release_lease
+
+    assert acquire_lease(db, "a") is True
+    assert acquire_lease(db, "b") is False  # held and not expired
+    release_lease(db, "a")
+    assert acquire_lease(db, "b") is True
+    release_lease(db, "b")
+    assert acquire_lease(db, "c", seconds=-1) is True  # expired lease can be taken over
+    assert acquire_lease(db, "d") is True
 
 
 def test_health_endpoints(client):

@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,9 +16,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = True
 
-    database_url: str = "postgresql+psycopg://wallet:wallet@localhost:5432/wallet"
-    db_pool_size: int = 5
-    db_max_overflow: int = 10
+    # Multi-document transactions require a replica set (a single-node one is fine).
+    mongodb_url: str = "mongodb://localhost:27017/?directConnection=true"
+    mongodb_db: str = "wallet"
+    mongodb_timeout_ms: int = 5000
+    mongodb_max_pool_size: int = 50
 
     jwt_secret: str = Field(default="change-me-in-production-please-32b+", min_length=32)
     jwt_algorithm: str = "HS256"
@@ -54,15 +56,6 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
-
-    @field_validator("database_url")
-    @classmethod
-    def _normalize_db_url(cls, v: str) -> str:
-        # Managed providers (Render, Heroku) hand out postgres:// URLs.
-        for prefix in ("postgres://", "postgresql://"):
-            if v.startswith(prefix):
-                return "postgresql+psycopg://" + v[len(prefix) :]
-        return v
 
 
 @lru_cache

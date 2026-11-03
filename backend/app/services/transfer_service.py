@@ -3,14 +3,16 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import or_, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from pymongo.client_session import ClientSession
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.core.errors import Conflict, NotFound, ValidationFailed
 from app.core.metrics import TRANSFERS
 from app.db.models import Transfer, User
+from app.db.mongo import TRANSFERS as TRANSFERS_COLL
+from app.db.mongo import Db, run_in_transaction
+from app.db.repository import hydrate_transfer
 from app.domain import money
 from app.domain.enums import TransactionType
 from app.services import fx_service, user_service, wallet_service
@@ -26,24 +28,26 @@ class TransferResult:
     replayed: bool = False
 
 
-def _replay(db: Session, sender_id: uuid.UUID, key: str | None, fp: str) -> TransferResult | None:
+def _replay(
+    db: Db, sender_id: uuid.UUID, key: str | None, fp: str, session: ClientSession | None = None
+) -> TransferResult | None:
     if not key:
         return None
-    t = db.scalar(
-        select(Transfer).where(Transfer.sender_id == sender_id, Transfer.idempotency_key == key)
+    doc = db[TRANSFERS_COLL].find_one(
+        {"sender_id": sender_id, "idempotency_key": key}, session=session
     )
-    if t is None:
+    if doc is None:
         return None
-    if t.request_hash != fp:
+    if doc.get("request_hash") != fp:
         raise Conflict(
             "Idempotency-Key was already used with a different request",
             code="IDEMPOTENCY_KEY_REUSED",
         )
-    return TransferResult(t, replayed=True)
+    return TransferResult(Transfer.from_doc(doc), replayed=True)
 
 
 def create_transfer(
-    db: Session,
+    db: Db,
     sender: User,
     *,
     recipient_email: str,
@@ -58,6 +62,7 @@ def create_transfer(
     - Sender is debited from their `source_currency` wallet (defaults to `currency`).
     - Recipient is credited in their default currency.
     - Both conversions use one FX snapshot, so the transfer is internally consistent.
+    - Debit, credit, transfer record and both ledger legs commit in one transaction.
     """
     currency = money.validate_currency(currency)
     source_currency = money.validate_currency(source_currency or currency)
@@ -75,7 +80,7 @@ def create_transfer(
     )
     if (prior := _replay(db, sender.id, idempotency_key, fp)) is not None:
         TRANSFERS.labels(outcome="replayed", cross_currency="n/a").inc()
-        return prior
+        return TransferResult(hydrate_transfer(db, prior.transfer), replayed=True)
 
     recipient = user_service.get_by_email(db, recipient_email)
     if recipient is None:
@@ -84,18 +89,19 @@ def create_transfer(
         raise ValidationFailed("You cannot transfer to yourself", code="SELF_TRANSFER")
     target_currency = recipient.default_currency
 
-    try:
-        source_wallet = wallet_service.find_wallet(db, sender.id, source_currency)
+    def txn(session: ClientSession) -> TransferResult:
+        if (prior := _replay(db, sender.id, idempotency_key, fp, session)) is not None:
+            return prior
+        source_wallet = wallet_service.find_wallet(db, sender.id, source_currency, session)
         if source_wallet is None:
             raise NotFound(f"You have no {source_currency} wallet", code="WALLET_NOT_FOUND")
         rates = fx_service.rates_if_needed(db, currency, source_currency, target_currency)
         debit_conv = fx_service.convert(amount, currency, source_currency, rates)
         credit_conv = fx_service.convert(amount, currency, target_currency, rates)
-        target_wallet = wallet_service.get_or_create_wallet(db, recipient.id, target_currency)
-        locked = wallet_service.lock_wallets(db, source_wallet.id, target_wallet.id)
-
+        target_wallet = wallet_service.get_or_create_wallet(
+            db, recipient.id, target_currency, session
+        )
         transfer = Transfer(
-            id=uuid.uuid4(),
             sender_id=sender.id,
             recipient_id=recipient.id,
             amount=amount,
@@ -111,7 +117,7 @@ def create_transfer(
             idempotency_key=idempotency_key,
             request_hash=fp,
         )
-        db.add(transfer)
+        db[TRANSFERS_COLL].insert_one(transfer.to_doc(), session=session)
         out_conv = Conversion(
             amount,
             currency,
@@ -122,7 +128,8 @@ def create_transfer(
         )
         wallet_service.post_entry(
             db,
-            locked[source_wallet.id],
+            session,
+            source_wallet,
             TransactionType.TRANSFER_OUT,
             out_conv,
             amount=debit_conv.target_amount,
@@ -132,7 +139,8 @@ def create_transfer(
         )
         wallet_service.post_entry(
             db,
-            locked[target_wallet.id],
+            session,
+            target_wallet,
             TransactionType.TRANSFER_IN,
             credit_conv,
             amount=credit_conv.target_amount,
@@ -140,38 +148,42 @@ def create_transfer(
             counterparty_id=sender.id,
             description=note,
         )
-        db.commit()
-    except IntegrityError:
-        db.rollback()
+        return TransferResult(transfer)
+
+    try:
+        result = run_in_transaction(db, txn)
+    except DuplicateKeyError:
         if (prior := _replay(db, sender.id, idempotency_key, fp)) is not None:
-            return prior
+            TRANSFERS.labels(outcome="replayed", cross_currency="n/a").inc()
+            return TransferResult(hydrate_transfer(db, prior.transfer), replayed=True)
         TRANSFERS.labels(outcome="error", cross_currency="n/a").inc()
         raise
     except Exception as exc:
-        db.rollback()
-        TRANSFERS.labels(outcome=getattr(exc, "code", "error").lower(), cross_currency="n/a").inc()
+        outcome = str(getattr(exc, "code", "error")).lower()
+        TRANSFERS.labels(outcome=outcome, cross_currency="n/a").inc()
         raise
 
+    hydrate_transfer(db, result.transfer)
+    if result.replayed:
+        TRANSFERS.labels(outcome="replayed", cross_currency="n/a").inc()
+        return result
     cross = str(len({currency, source_currency, target_currency}) > 1).lower()
     TRANSFERS.labels(outcome="success", cross_currency=cross).inc()
     log.info(
         "transfer_completed",
         extra={
-            "transfer_id": str(transfer.id),
+            "transfer_id": str(result.transfer.id),
             "recipient_id": str(recipient.id),
             "cross_currency": cross,
         },
     )
-    return TransferResult(transfer)
+    return result
 
 
-def get_transfer(db: Session, user_id: uuid.UUID, transfer_id: uuid.UUID) -> Transfer:
-    t = db.scalar(
-        select(Transfer).where(
-            Transfer.id == transfer_id,
-            or_(Transfer.sender_id == user_id, Transfer.recipient_id == user_id),
-        )
+def get_transfer(db: Db, user_id: uuid.UUID, transfer_id: uuid.UUID) -> Transfer:
+    doc = db[TRANSFERS_COLL].find_one(
+        {"_id": transfer_id, "$or": [{"sender_id": user_id}, {"recipient_id": user_id}]}
     )
-    if t is None:
+    if doc is None:
         raise NotFound("Transfer not found")
-    return t
+    return hydrate_transfer(db, Transfer.from_doc(doc))

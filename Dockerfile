@@ -21,8 +21,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/venv/bin:$PATH \
 RUN groupadd --system app && useradd --system --gid app --home /app app
 WORKDIR /app
 COPY --from=builder /venv /venv
-COPY backend/alembic.ini ./
-COPY backend/alembic ./alembic
 COPY backend/app ./app
 COPY --from=frontend /src/dist ./frontend_dist
 COPY infra/docker/entrypoint.sh /entrypoint.sh

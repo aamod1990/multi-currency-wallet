@@ -1,185 +1,175 @@
+"""Domain records persisted as MongoDB documents.
+
+Plain dataclasses keep services free of driver details; `to_doc`/`from_doc` map
+`id` <-> `_id`. Fields marked `transient` are hydrated for responses, never stored.
+"""
+
+import threading
+import time
 import uuid
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any, ClassVar, Self
 
-from sqlalchemy import (
-    CheckConstraint,
-    DateTime,
-    Enum,
-    ForeignKey,
-    Index,
-    LargeBinary,
-    Numeric,
-    String,
-    UniqueConstraint,
-    func,
-)
-from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.db.base import Base
 from app.domain.enums import TransactionType, TransferStatus
 
-AMOUNT = Numeric(20, 4)
-RATE = Numeric(28, 10)
+TRANSIENT = {"transient": True}
 
 
-def _now() -> datetime:
-    return datetime.now(UTC)
+def now() -> datetime:
+    # Mongo stores milliseconds; truncate up front so in-memory == persisted.
+    t = datetime.now(UTC)
+    return t.replace(microsecond=t.microsecond // 1000 * 1000)
 
 
-class TimestampMixin:
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, server_default=func.now(), nullable=False
-    )
+_seq_lock = threading.Lock()
+_last_ns = 0
 
 
-class User(TimestampMixin, Base):
-    __tablename__ = "users"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(100), nullable=False)
-    full_name: Mapped[str] = mapped_column(String(120), nullable=False)
-    default_currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
-    )
-
-    photo: Mapped["UserPhoto | None"] = relationship(
-        back_populates="user", uselist=False, lazy="noload", cascade="all, delete-orphan"
-    )
+def next_seq() -> int:
+    """Monotonic tiebreaker for entries created within the same millisecond."""
+    global _last_ns
+    with _seq_lock:
+        _last_ns = max(time.time_ns(), _last_ns + 1)
+        return _last_ns
 
 
-class UserPhoto(Base):
-    """Kept separate from users so profile reads never load blobs."""
+class Document:
+    collection: ClassVar[str]
+    enums: ClassVar[dict[str, type]] = {}
 
-    __tablename__ = "user_photos"
+    def to_doc(self) -> dict[str, Any]:
+        doc: dict[str, Any] = {}
+        for f in fields(self):  # type: ignore[arg-type]
+            if f.metadata.get("transient"):
+                continue
+            value = getattr(self, f.name)
+            if f.name in self.enums and value is not None:
+                value = value.value
+            doc["_id" if f.name == "id" else f.name] = value
+        return doc
 
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
-    content_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    etag: Mapped[str] = mapped_column(String(64), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-    user: Mapped[User] = relationship(back_populates="photo")
-
-
-class Wallet(TimestampMixin, Base):
-    __tablename__ = "wallets"
-    __table_args__ = (
-        UniqueConstraint("user_id", "currency", name="uq_wallets_user_currency"),
-        CheckConstraint("balance >= 0", name="balance_non_negative"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    balance: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False, default=Decimal(0))
-    # Optimistic version counter; row locks give the real guarantee, this aids auditing.
-    version: Mapped[int] = mapped_column(nullable=False, default=0)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
-    )
+    @classmethod
+    def from_doc(cls, doc: dict[str, Any]) -> Self:
+        names = {f.name for f in fields(cls) if not f.metadata.get("transient")}  # type: ignore[arg-type]
+        kwargs = {("id" if k == "_id" else k): v for k, v in doc.items()}
+        kwargs = {k: v for k, v in kwargs.items() if k in names}
+        for name, enum in cls.enums.items():
+            if kwargs.get(name) is not None:
+                kwargs[name] = enum(kwargs[name])
+        return cls(**kwargs)
 
 
-class FxRateSnapshot(Base):
+@dataclass
+class User(Document):
+    collection: ClassVar[str] = "users"
+
+    email: str
+    password_hash: str
+    full_name: str
+    default_currency: str
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: datetime = field(default_factory=now)
+    updated_at: datetime = field(default_factory=now)
+
+
+@dataclass
+class UserPhoto(Document):
+    """Separate collection so profile reads never load blobs. `id` == user id."""
+
+    collection: ClassVar[str] = "user_photos"
+
+    id: uuid.UUID
+    content_type: str
+    data: bytes
+    etag: str
+    updated_at: datetime = field(default_factory=now)
+
+
+@dataclass
+class Wallet(Document):
+    collection: ClassVar[str] = "wallets"
+
+    user_id: uuid.UUID
+    currency: str
+    balance: Decimal = Decimal(0)
+    version: int = 0
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: datetime = field(default_factory=now)
+    updated_at: datetime = field(default_factory=now)
+
+
+@dataclass
+class FxRateSnapshot(Document):
     """Immutable record of rates fetched from a provider. Every conversion references
     the snapshot it used, so any historical amount can be re-derived and audited."""
 
-    __tablename__ = "fx_rate_snapshots"
-    __table_args__ = (Index("ix_fx_rate_snapshots_fetched_at", "fetched_at"),)
+    collection: ClassVar[str] = "fx_rate_snapshots"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    provider: Mapped[str] = mapped_column(String(50), nullable=False)
-    base_currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    rates: Mapped[dict[str, str]] = mapped_column(JSONB, nullable=False)
-    provider_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-
-class Transfer(TimestampMixin, Base):
-    __tablename__ = "transfers"
-    __table_args__ = (
-        UniqueConstraint("sender_id", "idempotency_key", name="uq_transfers_sender_idem"),
-        CheckConstraint("sender_id <> recipient_id", name="no_self_transfer"),
-        CheckConstraint("amount > 0", name="amount_positive"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    sender_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    recipient_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
-    currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    source_amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
-    source_currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    source_rate: Mapped[Decimal] = mapped_column(RATE, nullable=False)
-    target_amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
-    target_currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    target_rate: Mapped[Decimal] = mapped_column(RATE, nullable=False)
-    fx_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("fx_rate_snapshots.id")
-    )
-    status: Mapped[TransferStatus] = mapped_column(
-        Enum(TransferStatus, name="transfer_status"), default=TransferStatus.COMPLETED
-    )
-    note: Mapped[str | None] = mapped_column(String(140))
-    idempotency_key: Mapped[str | None] = mapped_column(String(100))
-    request_hash: Mapped[str | None] = mapped_column(String(64))
-
-    sender: Mapped[User] = relationship(foreign_keys=[sender_id], lazy="joined")
-    recipient: Mapped[User] = relationship(foreign_keys=[recipient_id], lazy="joined")
+    provider: str
+    base_currency: str
+    rates: dict[str, str]
+    provider_updated_at: datetime | None = None
+    fetched_at: datetime = field(default_factory=now)
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
 
 
-class LedgerEntry(Base):
+@dataclass
+class Transfer(Document):
+    collection: ClassVar[str] = "transfers"
+    enums: ClassVar[dict[str, type]] = {"status": TransferStatus}
+
+    sender_id: uuid.UUID
+    recipient_id: uuid.UUID
+    amount: Decimal
+    currency: str
+    source_amount: Decimal
+    source_currency: str
+    source_rate: Decimal
+    target_amount: Decimal
+    target_currency: str
+    target_rate: Decimal
+    fx_snapshot_id: uuid.UUID | None = None
+    status: TransferStatus = TransferStatus.COMPLETED
+    note: str | None = None
+    idempotency_key: str | None = None
+    request_hash: str | None = None
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: datetime = field(default_factory=now)
+
+    sender: User | None = field(default=None, metadata=TRANSIENT)
+    recipient: User | None = field(default=None, metadata=TRANSIENT)
+
+
+@dataclass
+class LedgerEntry(Document):
     """Append-only, per-wallet ledger. A wallet's balance always equals the signed sum
     of its entries; `balance_after` makes every entry independently verifiable."""
 
-    __tablename__ = "ledger_entries"
-    __table_args__ = (
-        UniqueConstraint("user_id", "idempotency_key", name="uq_ledger_user_idem"),
-        CheckConstraint("amount > 0", name="amount_positive"),
-        CheckConstraint("balance_after >= 0", name="balance_after_non_negative"),
-        Index("ix_ledger_user_created", "user_id", "created_at"),
-        Index("ix_ledger_wallet_created", "wallet_id", "created_at"),
-        Index("ix_ledger_reference", "reference_id"),
-    )
+    collection: ClassVar[str] = "ledger_entries"
+    enums: ClassVar[dict[str, type]] = {"type": TransactionType}
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    wallet_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False
-    )
-    type: Mapped[TransactionType] = mapped_column(
-        Enum(TransactionType, name="transaction_type"), nullable=False
-    )
-    amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
-    currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    balance_after: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
+    user_id: uuid.UUID
+    wallet_id: uuid.UUID
+    type: TransactionType
+    amount: Decimal
+    currency: str
+    balance_after: Decimal
     # What the user asked for, before conversion into the wallet currency.
-    original_amount: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False)
-    original_currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    fx_rate: Mapped[Decimal] = mapped_column(RATE, nullable=False, default=Decimal(1))
-    fx_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("fx_rate_snapshots.id")
-    )
+    original_amount: Decimal
+    original_currency: str
+    fx_rate: Decimal = Decimal(1)
+    fx_snapshot_id: uuid.UUID | None = None
     # Groups the legs of a transfer/conversion.
-    reference_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    counterparty_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
-    )
-    description: Mapped[str | None] = mapped_column(String(140))
-    idempotency_key: Mapped[str | None] = mapped_column(String(100))
-    request_hash: Mapped[str | None] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now, server_default=func.now(), nullable=False
-    )
+    reference_id: uuid.UUID | None = None
+    counterparty_id: uuid.UUID | None = None
+    description: str | None = None
+    idempotency_key: str | None = None
+    request_hash: str | None = None
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: datetime = field(default_factory=now)
+    seq: int = field(default_factory=next_seq)
 
-    counterparty: Mapped[User | None] = relationship(foreign_keys=[counterparty_id], lazy="joined")
-    fx_snapshot: Mapped[FxRateSnapshot | None] = relationship(lazy="noload")
+    counterparty: User | None = field(default=None, metadata=TRANSIENT)
+    fx_snapshot: FxRateSnapshot | None = field(default=None, metadata=TRANSIENT)
