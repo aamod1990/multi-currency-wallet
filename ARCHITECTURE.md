@@ -6,14 +6,14 @@
              ┌──────────────────────── Docker image ────────────────────────┐
  Browser ──► │ FastAPI (uvicorn)                                            │
   (SPA)      │  ├─ /            React SPA (static, built by Vite)           │
-             │  ├─ /api/*       routers → services → domain / db            │──► PostgreSQL 16
+             │  ├─ /api/*       routers → services → domain / db            │──► MongoDB 7 (replica set)
              │  ├─ /health/*    liveness / readiness                        │
              │  ├─ /metrics     Prometheus                                  │◄── Prometheus ─► Grafana / Alertmanager
-             │  └─ FxRefresher  background thread (advisory-locked)         │──► open.er-api.com → Frankfurter (fallback)
+             │  └─ FxRefresher  background thread (lease-locked)            │──► open.er-api.com → Frankfurter (fallback)
              └──────────────────────────────────────────────────────────────┘
 ```
 
-A modular monolith: one process, one database, clear internal layers. This is deliberate — every operation that matters (transfers, conversions) needs a single ACID transaction across wallets of different users, which a monolith with one Postgres gives for free. Splitting into services would turn that into a distributed-transaction problem with no benefit at this scale.
+A modular monolith: one process, one database, clear internal layers. This is deliberate — every operation that matters (transfers, conversions) needs a single ACID transaction across wallets of different users, which a monolith with one MongoDB replica set gives via multi-document transactions. Splitting into services would turn that into a distributed-transaction problem with no benefit at this scale.
 
 ## 2. Layers (backend)
 
@@ -22,47 +22,53 @@ A modular monolith: one process, one database, clear internal layers. This is de
 | HTTP | `app/api` | routing, request/response schemas (Pydantic), auth dependency, idempotency header, mapping errors to HTTP | services |
 | Application | `app/services` | use cases: `wallet_service`, `transfer_service`, `fx_service`, `history_service`, `user_service`; transaction boundaries and locking | domain, db, fx |
 | Domain | `app/domain` | money rules: currency whitelist, minor units, quantization, cross rates, conversion; transaction types | nothing |
-| Infrastructure | `app/db`, `app/fx`, `app/core` | SQLAlchemy models/session, FX provider adapters, config, security, logging, metrics, middleware | — |
+| Infrastructure | `app/db`, `app/fx`, `app/core` | MongoDB client/codecs/schema, document dataclasses, FX provider adapters, config, security, logging, metrics, middleware | — |
 
 Rules: routers contain no business logic; services raise typed `AppError`s (`InsufficientFunds`, `Conflict`, `FxUnavailable`, …) that one handler turns into the error envelope; the domain layer is pure and unit-tested without a DB. FX providers implement a small `FxProvider` protocol, so the static provider (tests, offline) and the live chain are interchangeable.
 
-## 3. Data model
+## 3. Data model (MongoDB)
 
 ```
-users ─1:1─ user_photos
-  │
-  └─1:N─ wallets (user_id, currency) UNIQUE, balance NUMERIC(20,4) CHECK >= 0
-            │
-            └─1:N─ ledger_entries ──N:1── fx_rate_snapshots (provider, base, rates JSONB, fetched_at)
-                     │  type, amount, balance_after, original_amount/currency, fx_rate,
-                     │  reference_id ──► transfers.id | exchange pair id
-                     │  counterparty_user_id, idempotency_key (+request_hash)
-                     │
-transfers ───────────┘  sender/recipient, source_amount/currency, target_amount/currency,
-                        rates, fx_snapshot_id, idempotency_key UNIQUE(sender_id, key), CHECK sender≠recipient
+users            { _id: UUID, email (unique), password_hash, full_name, default_currency, ... }
+user_photos      { _id: user UUID, content_type, data: Binary, etag }
+wallets          { _id, user_id, currency, balance: Decimal128, version }   unique(user_id, currency)
+                   validator: balance >= 0
+fx_rate_snapshots{ _id, provider, base_currency, rates: {CCY: "rate"}, provider_updated_at, fetched_at }
+ledger_entries   { _id, user_id, wallet_id, type, amount, currency, balance_after,
+                   original_amount/currency, fx_rate, fx_snapshot_id, reference_id,
+                   counterparty_id, description, idempotency_key, request_hash, created_at, seq }
+                   validator: amount > 0, balance_after >= 0
+                   unique(user_id, idempotency_key) partial; idx(user_id, created_at, seq); idx(reference_id)
+transfers        { _id, sender_id, recipient_id, amount/currency, source_*, target_*, fx_snapshot_id,
+                   status, note, idempotency_key, request_hash, created_at }
+                   validator: amount > 0, sender_id != recipient_id; unique(sender_id, idempotency_key) partial
+locks            { _id: "fx-refresh", owner, expires_at }   (refresher lease)
 ```
 
-- **Ledger + materialized balance.** `ledger_entries` is append-only and is the audit trail; `wallets.balance` is a cache updated in the *same* transaction. Each entry stores `balance_after`, so any wallet's history can be verified by replaying entries.
-- **Money as `NUMERIC`/`Decimal` end-to-end.** No floats anywhere — DB columns are `NUMERIC(20,4)` (rates `NUMERIC(24,10)`), Python uses `Decimal`, and the API serializes amounts as strings. Amounts are quantized to the currency's minor unit with banker's rounding.
+- **References, not embedding.** The ledger is unbounded, so it can't be embedded in a wallet (16 MB document limit) and history needs its own indexes. Documents reference each other by UUID (`uuidRepresentation=standard`); dataclasses in `app/db/models.py` map `id` <-> `_id`, and `app/db/repository.py` hydrates counterparties/snapshots for responses.
+- **Ledger + materialized balance.** `ledger_entries` is append-only and is the audit trail; `wallets.balance` is a cache updated in the *same* transaction. Each entry stores `balance_after`, so any wallet's history can be verified by replaying entries (covered by a test).
+- **Money as `Decimal128`/`Decimal` end-to-end.** No floats anywhere — a `DecimalCodec` maps Python `Decimal` to BSON `Decimal128` (exact decimal arithmetic, including server-side `$inc`), and the API serializes amounts as strings. Amounts are quantized to the currency's minor unit with banker's rounding.
 - **Double-sided movements share a `reference_id`.** A transfer creates `TRANSFER_OUT` + `TRANSFER_IN`; an exchange creates `CONVERSION_OUT` + `CONVERSION_IN`. Both legs point to the same FX snapshot.
-- **Indexes** follow the read paths: `(user_id, created_at DESC)` for history, `(wallet_id, created_at)`, `reference_id`.
+- **Ordering.** MongoDB dates have millisecond precision, so entries also carry a monotonic `seq` used as a tiebreaker for stable newest-first pagination.
+- **Schema enforcement.** Collections, JSON validators and indexes are created idempotently at startup (`ensure_schema`) — the MongoDB equivalent of migrations for this schema.
 
 ## 4. Consistency controls
 
 Concurrency is the core risk of a wallet. Controls, outermost to innermost:
 
-1. **Idempotency keys** (`Idempotency-Key` header, optional) on credit/debit/exchange/transfer. Stored with a SHA-256 fingerprint of the request body under a unique constraint `(user, key)`. Same key + same body → the original result is replayed (`200` instead of `201`); same key + different body → `409 IDEMPOTENCY_KEY_REUSED`. Two concurrent requests with the same key race on the unique constraint; the loser rolls back and replays the winner. The frontend generates one key per logical submission, so double-clicks and retries are safe.
-2. **One DB transaction per operation**, with wallets locked via `SELECT … FOR UPDATE` **in a stable order (by wallet id)**. Two opposite transfers A→B and B→A therefore lock in the same order and cannot deadlock (covered by a concurrency test).
-3. **Check-then-write under lock**: the balance check happens after the lock is held, so no lost updates or overdrafts.
-4. **Database constraints as the last line of defence**: `CHECK (balance >= 0)`, positive amounts, `sender_id <> recipient_id`, unique `(user_id, currency)` wallets.
-5. **Single FX snapshot per operation**: both legs of a cross-currency transfer use one snapshot, so the debit and credit are mutually consistent and reproducible.
+1. **Idempotency keys** (`Idempotency-Key` header, optional) on credit/debit/exchange/transfer. Stored with a SHA-256 fingerprint of the request body under a partial unique index `(user, key)`. Same key + same body → the original result is replayed (`200` instead of `201`); same key + different body → `409 IDEMPOTENCY_KEY_REUSED`. The replay check runs *inside* the transaction, so a retried attempt sees a concurrent winner; a `DuplicateKeyError` after commit also falls back to replay. The frontend generates one key per logical submission, so double-clicks and retries are safe.
+2. **One multi-document transaction per operation** (`run_in_transaction`: snapshot read concern, majority write concern). Debit, credit, transfer record and both ledger legs commit or abort together.
+3. **Conditional atomic updates**: outflows use `find_one_and_update({_id, balance: {$gte: amount}}, {$inc: {balance: -amount}})`. If the filter doesn't match, the operation fails with `INSUFFICIENT_FUNDS` — an overdraft can never be written.
+4. **Write-conflict detection instead of locks**: two transactions that modify the same wallet can't both commit; MongoDB aborts one with a `TransientTransactionError` and `with_transaction` re-runs it against fresh data. There are no lock waits, so opposite transfers A→B / B→A cannot deadlock.
+5. **Database validators as the last line of defence**: `balance >= 0`, positive amounts, `sender_id != recipient_id`, unique `(user_id, currency)` wallets.
+6. **Single FX snapshot per operation**: both legs of a cross-currency transfer use one snapshot, so the debit and credit are mutually consistent and reproducible.
 
-Integration tests hammer these paths with threads against real Postgres: 20 concurrent debits that would overdraw, bidirectional transfer storms (asserting no deadlock and conservation of money), and concurrent reuse of an idempotency key.
+Integration tests hammer these paths with threads against a real replica set: 20 concurrent debits that would overdraw, bidirectional transfer storms (asserting no lost updates and conservation of money), concurrent reuse of an idempotency key, and a direct write that the validator must reject.
 
 ## 5. Currency exchange
 
 - **Providers**: `OpenErApiProvider` (primary, free, no key, ~160 currencies) → `FrankfurterProvider` (ECB data, fallback) via `ChainedProvider`. Responses are validated, filtered to supported currencies, and parsed as `Decimal`; malformed payloads count as failures.
-- **Refresh**: `FxRefresher` thread runs every `FX_REFRESH_INTERVAL_SECONDS` (default 1 h — the providers update daily/hourly). It takes a Postgres **advisory lock** so only one replica fetches, and skips if the latest snapshot is still fresh. Success/failure are logged and counted (`fx_refresh_total`, `fx_rates_last_success_timestamp_seconds`). A first refresh runs at startup.
+- **Refresh**: `FxRefresher` thread runs every `FX_REFRESH_INTERVAL_SECONDS` (default 1 h — the providers update daily/hourly). It takes a short **lease document** in the `locks` collection (atomic upsert on `_id` with an `expires_at`, so a crashed holder can't block forever) so only one replica fetches, and skips if the latest snapshot is still fresh. Success/failure are logged and counted (`fx_refresh_total`, `fx_rates_last_success_timestamp_seconds`). A first refresh runs at startup.
 - **Snapshots are immutable rows**. Every converted ledger entry/transfer stores `fx_snapshot_id` and the effective `fx_rate`; `GET /api/transactions/{id}` and `GET /api/fx/snapshots/{id}` expose provider, fetch time and all rates — this is the *conversion traceability* requirement.
 - **Staleness guard**: if the newest snapshot is older than `FX_MAX_AGE_SECONDS`, conversions fail fast with `503 FX_UNAVAILABLE` rather than using unsafe rates. Same-currency operations don't need rates and keep working. Readiness reports `degraded` in this state.
 
@@ -87,8 +93,8 @@ Integration tests hammer these paths with threads against real Postgres: 20 conc
 
 - Every unhandled exception becomes a `500` JSON envelope with a `request_id`, counted in `app_unhandled_exceptions_total` and logged with stack trace — never an HTML page or stack trace to the client.
 - External calls (FX) have timeouts and a fallback provider; failure degrades only cross-currency features.
-- DB pool with `pool_pre_ping`; readiness fails (503) when the DB is unreachable so the platform stops routing traffic.
-- Migrations run on boot via Alembic (idempotent); the frontend retries only transient errors (network/5xx), never 4xx, and never auto-retries mutations (idempotency keys make manual retries safe).
+- PyMongo connection pool with server-selection timeout; readiness (`ping`) fails (503) when the DB is unreachable so the platform stops routing traffic.
+- Collections, validators and indexes are ensured on boot (idempotent); transient transaction errors are retried automatically; the frontend retries only transient errors (network/5xx), never 4xx, and never auto-retries mutations (idempotency keys make manual retries safe).
 
 ## 9. Observability
 

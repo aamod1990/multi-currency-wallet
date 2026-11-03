@@ -8,8 +8,12 @@ services:
     healthCheckPath: /health/ready
     autoDeploy: false   # CD is driven by GitHub Actions (deploy hook) after CI passes
     envVars:
-      - key: DATABASE_URL
-        fromDatabase: { name: wallet-db, property: connectionString }
+      # MongoDB Atlas (free M0 cluster is a replica set, so transactions work):
+      # mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=true&w=majority
+      - key: MONGODB_URL
+        sync: false
+      - key: MONGODB_DB
+        value: wallet
       - key: JWT_SECRET
         generateValue: true
       - key: METRICS_TOKEN
@@ -21,8 +25,3 @@ services:
       - key: ALERT_WEBHOOK_URL
         sync: false
 
-databases:
-  - name: wallet-db
-    plan: free
-    databaseName: wallet
-    user: wallet

@@ -1,31 +1,37 @@
-# Local stack:            docker compose up --build        -> http://localhost:8000
+# Local stack:            docker compose up --build        -> http://localhost:8000 (app + MongoDB)
 # With monitoring:        docker compose --profile monitoring up --build
 #                         Prometheus http://localhost:9090, Grafana http://localhost:3000 (admin/admin)
 services:
-  db:
-    image: public.ecr.aws/docker/library/postgres:16-alpine
-    environment:
-      POSTGRES_USER: wallet
-      POSTGRES_PASSWORD: wallet
-      POSTGRES_DB: wallet
+  mongo:
+    image: ${MONGO_IMAGE:-public.ecr.aws/docker/library/mongo:7}
+    # Transactions need a replica set; a single node is enough. The healthcheck
+    # initiates it on first boot and then reports readiness.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mongodata:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]}).ok }"
       interval: 5s
-      timeout: 3s
-      retries: 10
+      timeout: 5s
+      retries: 20
+      start_period: 5s
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "${MONGO_PORT:-27017}:27017"
 
   app:
     build: .
     image: multi-currency-wallet:local
     depends_on:
-      db:
+      mongo:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg://wallet:wallet@db:5432/wallet
+      MONGODB_URL: mongodb://mongo:27017/?replicaSet=rs0
+      MONGODB_DB: wallet
       ENVIRONMENT: local
       JWT_SECRET: ${JWT_SECRET:-local-dev-secret-change-me-0123456789abcdef}
       FX_PROVIDER: ${FX_PROVIDER:-live}
@@ -64,4 +70,4 @@ services:
     depends_on: [prometheus]
 
 volumes:
-  pgdata:
+  mongodata:

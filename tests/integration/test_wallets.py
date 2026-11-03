@@ -1,8 +1,6 @@
 from decimal import Decimal
 
-from sqlalchemy import func, select
-
-from app.db.models import LedgerEntry, Wallet
+from app.db.mongo import LEDGER, WALLETS
 from app.domain.enums import TransactionType
 
 
@@ -150,13 +148,25 @@ def test_ledger_balance_invariant(make_user, db):
         "/api/wallets/exchange",
         {"amount": "20", "from_currency": "USD", "to_currency": "GBP"},
     )
-    for wallet in db.scalars(select(Wallet)).all():
-        entries = db.scalars(
-            select(LedgerEntry).where(LedgerEntry.wallet_id == wallet.id)
-        ).all()
+    for wallet in db[WALLETS].find():
+        entries = list(db[LEDGER].find({"wallet_id": wallet["_id"]}).sort("seq"))
         signed = sum(
-            (-e.amount if TransactionType(e.type).is_outflow else e.amount)
+            (-e["amount"] if TransactionType(e["type"]).is_outflow else e["amount"])
             for e in entries
         )
-        assert signed == wallet.balance
-    assert db.scalar(select(func.count()).select_from(LedgerEntry)) == 4
+        assert signed == wallet["balance"]
+        if entries:
+            assert entries[-1]["balance_after"] == wallet["balance"]
+    assert db[LEDGER].count_documents({}) == 4
+
+
+def test_db_validator_rejects_negative_balance(make_user, db):
+    import pytest
+    from pymongo.errors import WriteError
+
+    u = make_user("USD")
+    with pytest.raises(WriteError):
+        db[WALLETS].update_one(
+            {"currency": "USD"}, {"$set": {"balance": Decimal("-1")}}
+        )
+    assert u.balances()["USD"] == "0"

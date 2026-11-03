@@ -3,15 +3,15 @@ import io
 import logging
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from pymongo.client_session import ClientSession
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import get_settings
 from app.core.errors import Conflict, NotFound, Unauthorized, ValidationFailed
 from app.core.metrics import AUTH_EVENTS
 from app.core.security import DUMMY_HASH, hash_password, verify_password
-from app.db.models import User, UserPhoto
+from app.db.models import User, UserPhoto, now
+from app.db.mongo import USER_PHOTOS, USERS, Db, run_in_transaction
 from app.domain.money import validate_currency
 from app.services import wallet_service
 
@@ -26,13 +26,12 @@ def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
-def get_by_email(db: Session, email: str) -> User | None:
-    return db.scalar(select(User).where(func.lower(User.email) == normalize_email(email)))
+def get_by_email(db: Db, email: str) -> User | None:
+    doc = db[USERS].find_one({"email": normalize_email(email)})
+    return User.from_doc(doc) if doc else None
 
 
-def signup(
-    db: Session, *, email: str, password: str, full_name: str, default_currency: str
-) -> User:
+def signup(db: Db, *, email: str, password: str, full_name: str, default_currency: str) -> User:
     currency = validate_currency(default_currency)
     user = User(
         email=normalize_email(email),
@@ -40,21 +39,22 @@ def signup(
         full_name=full_name.strip(),
         default_currency=currency,
     )
-    db.add(user)
+
+    def txn(session: ClientSession) -> None:
+        db[USERS].insert_one(user.to_doc(), session=session)
+        wallet_service.get_or_create_wallet(db, user.id, currency, session)
+
     try:
-        db.flush()
-    except IntegrityError as exc:
-        db.rollback()
+        run_in_transaction(db, txn)
+    except DuplicateKeyError as exc:
         AUTH_EVENTS.labels(event="signup", outcome="duplicate").inc()
         raise Conflict("An account with this email already exists", code="EMAIL_TAKEN") from exc
-    wallet_service.get_or_create_wallet(db, user.id, currency)
-    db.commit()
     AUTH_EVENTS.labels(event="signup", outcome="success").inc()
     log.info("user_signed_up", extra={"new_user_id": str(user.id)})
     return user
 
 
-def authenticate(db: Session, email: str, password: str) -> User:
+def authenticate(db: Db, email: str, password: str) -> User:
     user = get_by_email(db, email)
     # Always run bcrypt so response time doesn't reveal whether the email exists.
     ok = verify_password(password, user.password_hash if user else DUMMY_HASH)
@@ -66,19 +66,28 @@ def authenticate(db: Session, email: str, password: str) -> User:
 
 
 def update_profile(
-    db: Session, user: User, *, full_name: str | None, default_currency: str | None
+    db: Db, user: User, *, full_name: str | None, default_currency: str | None
 ) -> User:
     if full_name is not None:
         user.full_name = full_name.strip()
     if default_currency is not None:
         user.default_currency = validate_currency(default_currency)
         wallet_service.get_or_create_wallet(db, user.id, user.default_currency)
-    db.commit()
-    db.refresh(user)
+    user.updated_at = now()
+    db[USERS].update_one(
+        {"_id": user.id},
+        {
+            "$set": {
+                "full_name": user.full_name,
+                "default_currency": user.default_currency,
+                "updated_at": user.updated_at,
+            }
+        },
+    )
     return user
 
 
-def set_photo(db: Session, user: User, data: bytes) -> UserPhoto:
+def set_photo(db: Db, user: User, data: bytes) -> UserPhoto:
     """Validate by decoding (never trust Content-Type), then re-encode: this strips
     EXIF/GPS metadata and neutralises polyglot files."""
     if not data:
@@ -105,28 +114,26 @@ def set_photo(db: Session, user: User, data: bytes) -> UserPhoto:
         raise ValidationFailed("File is not a valid image") from exc
 
     encoded = out.getvalue()
-    photo = db.get(UserPhoto, user.id) or UserPhoto(user_id=user.id)
-    photo.data = encoded
-    photo.content_type = content_type
-    photo.etag = hashlib.sha256(encoded).hexdigest()[:32]
-    db.add(photo)
-    db.commit()
+    photo = UserPhoto(
+        id=user.id,
+        content_type=content_type,
+        data=encoded,
+        etag=hashlib.sha256(encoded).hexdigest()[:32],
+    )
+    db[USER_PHOTOS].replace_one({"_id": user.id}, photo.to_doc(), upsert=True)
     return photo
 
 
-def get_photo(db: Session, user_id) -> UserPhoto:
-    photo = db.get(UserPhoto, user_id)
-    if photo is None:
+def get_photo(db: Db, user_id) -> UserPhoto:
+    doc = db[USER_PHOTOS].find_one({"_id": user_id})
+    if doc is None:
         raise NotFound("No profile photo")
-    return photo
+    return UserPhoto.from_doc(doc)
 
 
-def delete_photo(db: Session, user: User) -> None:
-    photo = db.get(UserPhoto, user.id)
-    if photo:
-        db.delete(photo)
-        db.commit()
+def delete_photo(db: Db, user: User) -> None:
+    db[USER_PHOTOS].delete_one({"_id": user.id})
 
 
-def has_photo(db: Session, user_id) -> bool:
-    return (db.scalar(select(func.count()).where(UserPhoto.user_id == user_id)) or 0) > 0
+def has_photo(db: Db, user_id) -> bool:
+    return db[USER_PHOTOS].count_documents({"_id": user_id}, limit=1) > 0

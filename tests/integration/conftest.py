@@ -1,23 +1,23 @@
-"""Integration tests run the real FastAPI app against a real PostgreSQL database
-(row locks, CHECK constraints and ON CONFLICT semantics can't be faked with SQLite).
+"""Integration tests run the real FastAPI app against a real MongoDB replica set
+(multi-document transactions, write conflicts and unique indexes can't be faked).
 
-Set TEST_DATABASE_URL, e.g. postgresql+psycopg://wallet:wallet@localhost:5432/wallet_test
+Set TEST_MONGODB_URL, e.g. mongodb://localhost:27017/?directConnection=true
 """
 
 import os
 import uuid
-from pathlib import Path
 
 import pytest
 
-TEST_DB = os.environ.get("TEST_DATABASE_URL")
+TEST_DB = os.environ.get("TEST_MONGODB_URL")
 if not TEST_DB:
     pytest.skip(
-        "TEST_DATABASE_URL not set; skipping integration tests", allow_module_level=True
+        "TEST_MONGODB_URL not set; skipping integration tests", allow_module_level=True
     )
 
 os.environ.update(
-    DATABASE_URL=TEST_DB,
+    MONGODB_URL=TEST_DB,
+    MONGODB_DB="wallet_test",
     ENVIRONMENT="test",
     FX_PROVIDER="static",
     FX_REFRESH_ENABLED="false",
@@ -26,46 +26,36 @@ os.environ.update(
     LOG_LEVEL="WARNING",
 )
 
-from alembic import command  # noqa: E402
-from alembic.config import Config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import text  # noqa: E402
 
 from app.api.routes.auth import login_limiter  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
-from app.db.session import get_engine, session_factory  # noqa: E402
+from app.db.mongo import ensure_schema, get_client, get_database  # noqa: E402
 from app.fx.providers import StaticProvider  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.services import fx_service  # noqa: E402
 
-BACKEND = Path(__file__).resolve().parents[2] / "backend"
-TABLES = "ledger_entries, transfers, user_photos, wallets, fx_rate_snapshots, users"
-
 
 @pytest.fixture(scope="session", autouse=True)
-def migrated_db():
-    cfg = Config(str(BACKEND / "alembic.ini"))
-    cfg.set_main_option("script_location", str(BACKEND / "alembic"))
-    cfg.set_main_option("sqlalchemy.url", TEST_DB)
-    command.downgrade(cfg, "base")
-    command.upgrade(cfg, "head")
+def fresh_schema():
+    get_client().drop_database(get_settings().mongodb_db)
+    ensure_schema(get_database())
     yield
 
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    with get_engine().begin() as conn:
-        conn.execute(text(f"TRUNCATE {TABLES} CASCADE"))
+    db = get_database()
+    for name in db.list_collection_names():
+        db[name].delete_many({})
     login_limiter.reset()
-    with session_factory()() as db:
-        fx_service.refresh_rates(db, StaticProvider())
+    fx_service.refresh_rates(db, StaticProvider())
     yield
 
 
 @pytest.fixture
 def db():
-    with session_factory()() as s:
-        yield s
+    return get_database()
 
 
 @pytest.fixture(scope="session")

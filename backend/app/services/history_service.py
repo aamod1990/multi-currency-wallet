@@ -2,12 +2,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from typing import Any
 
 from app.core.errors import NotFound, ValidationFailed
 from app.db.models import LedgerEntry
+from app.db.mongo import LEDGER, Db
+from app.db.repository import hydrate_entries
 from app.domain.enums import TransactionType
 
 
@@ -27,45 +27,50 @@ IN_TYPES = [t for t in TransactionType if not t.is_outflow]
 
 
 def list_entries(
-    db: Session, user_id: uuid.UUID, f: HistoryFilter, page: int, page_size: int
+    db: Db, user_id: uuid.UUID, f: HistoryFilter, page: int, page_size: int
 ) -> tuple[list[LedgerEntry], int]:
     if f.date_from and f.date_to and f.date_from > f.date_to:
         raise ValidationFailed("date_from must be before date_to")
-    conds = [LedgerEntry.user_id == user_id]
+    query: dict[str, Any] = {"user_id": user_id}
+    type_conds: list[set[str]] = []
     if f.types:
-        conds.append(LedgerEntry.type.in_(f.types))
+        type_conds.append({t.value for t in f.types})
     if f.direction == "in":
-        conds.append(LedgerEntry.type.in_(IN_TYPES))
+        type_conds.append({t.value for t in IN_TYPES})
     elif f.direction == "out":
-        conds.append(LedgerEntry.type.in_(OUT_TYPES))
+        type_conds.append({t.value for t in OUT_TYPES})
+    if type_conds:
+        query["type"] = {"$in": sorted(set.intersection(*type_conds))}
     if f.currency:
-        conds.append(LedgerEntry.currency == f.currency)
+        query["currency"] = f.currency
+    created: dict[str, Any] = {}
     if f.date_from:
-        conds.append(LedgerEntry.created_at >= f.date_from)
+        created["$gte"] = f.date_from
     if f.date_to:
-        conds.append(LedgerEntry.created_at <= f.date_to)
+        created["$lte"] = f.date_to
+    if created:
+        query["created_at"] = created
+    amount: dict[str, Any] = {}
     if f.min_amount is not None:
-        conds.append(LedgerEntry.amount >= f.min_amount)
+        amount["$gte"] = f.min_amount
     if f.max_amount is not None:
-        conds.append(LedgerEntry.amount <= f.max_amount)
+        amount["$lte"] = f.max_amount
+    if amount:
+        query["amount"] = amount
 
-    total = db.scalar(select(func.count()).select_from(LedgerEntry).where(*conds)) or 0
-    items = db.scalars(
-        select(LedgerEntry)
-        .where(*conds)
-        .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
-        .offset((page - 1) * page_size)
+    total = db[LEDGER].count_documents(query)
+    cursor = (
+        db[LEDGER]
+        .find(query)
+        .sort([("created_at", -1), ("seq", -1)])
+        .skip((page - 1) * page_size)
         .limit(page_size)
-    ).all()
-    return list(items), total
-
-
-def get_entry(db: Session, user_id: uuid.UUID, entry_id: uuid.UUID) -> LedgerEntry:
-    entry = db.scalar(
-        select(LedgerEntry)
-        .options(selectinload(LedgerEntry.fx_snapshot))
-        .where(LedgerEntry.id == entry_id, LedgerEntry.user_id == user_id)
     )
-    if entry is None:
+    return hydrate_entries(db, [LedgerEntry.from_doc(d) for d in cursor]), total
+
+
+def get_entry(db: Db, user_id: uuid.UUID, entry_id: uuid.UUID) -> LedgerEntry:
+    doc = db[LEDGER].find_one({"_id": entry_id, "user_id": user_id})
+    if doc is None:
         raise NotFound("Transaction not found")
-    return entry
+    return hydrate_entries(db, [LedgerEntry.from_doc(doc)], with_snapshot=True)[0]
