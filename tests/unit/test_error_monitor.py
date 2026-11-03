@@ -12,7 +12,10 @@ class FakeClock:
 def make():
     clock = FakeClock()
     cfg = MonitorConfig(
-        window_seconds=60, min_requests=10, threshold_5xx=0.1, threshold_4xx=0.5,
+        window_seconds=60,
+        min_requests=10,
+        threshold_5xx=0.1,
+        threshold_4xx=0.5,
         cooldown_seconds=300,
     )
     return ErrorRateMonitor(cfg, clock=clock), clock

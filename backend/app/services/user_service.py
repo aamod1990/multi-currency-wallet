@@ -129,4 +129,4 @@ def delete_photo(db: Session, user: User) -> None:
 
 
 def has_photo(db: Session, user_id) -> bool:
-    return db.scalar(select(func.count()).where(UserPhoto.user_id == user_id)) > 0
+    return (db.scalar(select(func.count()).where(UserPhoto.user_id == user_id)) or 0) > 0

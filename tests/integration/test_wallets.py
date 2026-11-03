@@ -53,7 +53,10 @@ def test_debit_and_insufficient_funds(make_user):
 def test_debit_in_other_currency_converts(make_user):
     u = make_user("USD")
     u.credit("100")
-    r = u.post("/api/wallets/debit", {"amount": "46", "currency": "EUR", "wallet_currency": "USD"})
+    r = u.post(
+        "/api/wallets/debit",
+        {"amount": "46", "currency": "EUR", "wallet_currency": "USD"},
+    )
     assert r.status_code == 201
     assert r.json()["transactions"][0]["amount"] == "50"
     assert u.balances()["USD"] == "50"
@@ -77,14 +80,22 @@ def test_amount_validation(make_user):
 
 def test_idempotent_credit_replays_without_double_posting(make_user, db):
     u = make_user("USD")
-    first = u.post("/api/wallets/credit", {"amount": "10", "currency": "USD"}, idem="key-12345")
-    second = u.post("/api/wallets/credit", {"amount": "10", "currency": "USD"}, idem="key-12345")
+    first = u.post(
+        "/api/wallets/credit", {"amount": "10", "currency": "USD"}, idem="key-12345"
+    )
+    second = u.post(
+        "/api/wallets/credit", {"amount": "10", "currency": "USD"}, idem="key-12345"
+    )
     assert first.status_code == 201
     assert second.status_code == 200
     assert second.headers["Idempotent-Replayed"] == "true"
-    assert first.json()["transactions"][0]["id"] == second.json()["transactions"][0]["id"]
+    assert (
+        first.json()["transactions"][0]["id"] == second.json()["transactions"][0]["id"]
+    )
     assert u.balances()["USD"] == "10"
-    reuse = u.post("/api/wallets/credit", {"amount": "11", "currency": "USD"}, idem="key-12345")
+    reuse = u.post(
+        "/api/wallets/credit", {"amount": "11", "currency": "USD"}, idem="key-12345"
+    )
     assert reuse.status_code == 409
     assert reuse.json()["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
 
@@ -92,13 +103,17 @@ def test_idempotent_credit_replays_without_double_posting(make_user, db):
 def test_exchange_between_own_wallets(make_user):
     u = make_user("USD")
     u.credit("100")
-    r = u.post("/api/wallets/exchange",
-               {"amount": "50", "from_currency": "USD", "to_currency": "EUR"})
+    r = u.post(
+        "/api/wallets/exchange",
+        {"amount": "50", "from_currency": "USD", "to_currency": "EUR"},
+    )
     assert r.status_code == 201, r.text
     legs = {t["type"]: t for t in r.json()["transactions"]}
     assert legs["CONVERSION_OUT"]["amount"] == "50"
     assert legs["CONVERSION_IN"]["amount"] == "46"
-    assert legs["CONVERSION_OUT"]["reference_id"] == legs["CONVERSION_IN"]["reference_id"]
+    assert (
+        legs["CONVERSION_OUT"]["reference_id"] == legs["CONVERSION_IN"]["reference_id"]
+    )
     assert u.balances() == {"USD": "50", "EUR": "46"}
 
 
@@ -107,7 +122,10 @@ def test_stale_rates_block_conversion_but_not_same_currency(make_user, db, monke
 
     u = make_user("USD")
     monkeypatch.setattr(get_settings(), "fx_max_age_seconds", -1)
-    r = u.post("/api/wallets/credit", {"amount": "10", "currency": "EUR", "wallet_currency": "USD"})
+    r = u.post(
+        "/api/wallets/credit",
+        {"amount": "10", "currency": "EUR", "wallet_currency": "USD"},
+    )
     assert r.status_code == 503
     assert r.json()["error"]["code"] == "FX_RATES_UNAVAILABLE"
     u.credit("10")  # same-currency still works
@@ -128,11 +146,17 @@ def test_ledger_balance_invariant(make_user, db):
     u = make_user("USD")
     u.credit("100")
     u.post("/api/wallets/debit", {"amount": "30", "currency": "USD"})
-    u.post("/api/wallets/exchange", {"amount": "20", "from_currency": "USD", "to_currency": "GBP"})
+    u.post(
+        "/api/wallets/exchange",
+        {"amount": "20", "from_currency": "USD", "to_currency": "GBP"},
+    )
     for wallet in db.scalars(select(Wallet)).all():
-        entries = db.scalars(select(LedgerEntry).where(LedgerEntry.wallet_id == wallet.id)).all()
+        entries = db.scalars(
+            select(LedgerEntry).where(LedgerEntry.wallet_id == wallet.id)
+        ).all()
         signed = sum(
-            (-e.amount if TransactionType(e.type).is_outflow else e.amount) for e in entries
+            (-e.amount if TransactionType(e.type).is_outflow else e.amount)
+            for e in entries
         )
         assert signed == wallet.balance
     assert db.scalar(select(func.count()).select_from(LedgerEntry)) == 4

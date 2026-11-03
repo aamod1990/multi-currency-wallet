@@ -20,15 +20,24 @@ def test_signup_returns_token_and_creates_default_wallet(make_user):
 
 def test_signup_duplicate_email_case_insensitive(client, make_user):
     make_user(email="dup@example.com")
-    r = client.post("/api/auth/signup", json={
-        "email": "DUP@example.com", "password": "Passw0rd!", "full_name": "X"})
+    r = client.post(
+        "/api/auth/signup",
+        json={"email": "DUP@example.com", "password": "Passw0rd!", "full_name": "X"},
+    )
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "EMAIL_TAKEN"
 
 
 def test_signup_validation(client):
-    r = client.post("/api/auth/signup", json={
-        "email": "not-an-email", "password": "short", "full_name": "", "default_currency": "ZZZ"})
+    r = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "not-an-email",
+            "password": "short",
+            "full_name": "",
+            "default_currency": "ZZZ",
+        },
+    )
     assert r.status_code == 422
     body = r.json()["error"]
     assert body["code"] == "VALIDATION_ERROR"
@@ -37,21 +46,31 @@ def test_signup_validation(client):
 
 
 def test_signup_unsupported_currency(client):
-    r = client.post("/api/auth/signup", json={
-        "email": "c@example.com", "password": "Passw0rd!", "full_name": "C",
-        "default_currency": "XYZ"})
+    r = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "c@example.com",
+            "password": "Passw0rd!",
+            "full_name": "C",
+            "default_currency": "XYZ",
+        },
+    )
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "UNSUPPORTED_CURRENCY"
 
 
 def test_login_success_and_failure(client, make_user):
     u = make_user()
-    ok = client.post("/api/auth/login", json={"email": u.email.upper(), "password": "Passw0rd!"})
+    ok = client.post(
+        "/api/auth/login", json={"email": u.email.upper(), "password": "Passw0rd!"}
+    )
     assert ok.status_code == 200
     assert ok.json()["access_token"]
     bad = client.post("/api/auth/login", json={"email": u.email, "password": "nope"})
     assert bad.status_code == 401
-    unknown = client.post("/api/auth/login", json={"email": "x@y.io", "password": "nope"})
+    unknown = client.post(
+        "/api/auth/login", json={"email": "x@y.io", "password": "nope"}
+    )
     assert unknown.status_code == 401
     assert bad.json()["error"]["message"] == unknown.json()["error"]["message"]
 
@@ -59,7 +78,9 @@ def test_login_success_and_failure(client, make_user):
 def test_login_rate_limited(client, make_user):
     u = make_user()
     codes = [
-        client.post("/api/auth/login", json={"email": u.email, "password": "bad"}).status_code
+        client.post(
+            "/api/auth/login", json={"email": u.email, "password": "bad"}
+        ).status_code
         for _ in range(12)
     ]
     assert codes[-1] == 429
@@ -94,16 +115,22 @@ def test_photo_upload_resizes_and_strips(make_user):
     img = Image.open(io.BytesIO(photo.content))
     assert max(img.size) <= 512
     etag = photo.headers["etag"]
-    assert u.get("/api/users/me/photo", headers={"If-None-Match": etag}).status_code == 304
+    assert (
+        u.get("/api/users/me/photo", headers={"If-None-Match": etag}).status_code == 304
+    )
     assert u.delete("/api/users/me/photo").status_code == 204
     assert u.get("/api/users/me/photo").status_code == 404
 
 
 def test_photo_rejects_non_images_and_large_files(make_user):
     u = make_user()
-    fake = u.put("/api/users/me/photo", files={"file": ("x.png", b"<?php evil", "image/png")})
+    fake = u.put(
+        "/api/users/me/photo", files={"file": ("x.png", b"<?php evil", "image/png")}
+    )
     assert fake.status_code == 422
-    big = u.put("/api/users/me/photo",
-                files={"file": ("x.png", b"0" * (2 * 1024 * 1024 + 10), "image/png")})
+    big = u.put(
+        "/api/users/me/photo",
+        files={"file": ("x.png", b"0" * (2 * 1024 * 1024 + 10), "image/png")},
+    )
     assert big.status_code == 422
     assert big.json()["error"]["code"] == "FILE_TOO_LARGE"

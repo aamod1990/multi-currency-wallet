@@ -12,7 +12,9 @@ import pytest
 
 TEST_DB = os.environ.get("TEST_DATABASE_URL")
 if not TEST_DB:
-    pytest.skip("TEST_DATABASE_URL not set; skipping integration tests", allow_module_level=True)
+    pytest.skip(
+        "TEST_DATABASE_URL not set; skipping integration tests", allow_module_level=True
+    )
 
 os.environ.update(
     DATABASE_URL=TEST_DB,
@@ -86,7 +88,9 @@ class ApiUser:
         self.headers = {"Authorization": f"Bearer {payload['access_token']}"}
 
     def get(self, url, **kw):
-        return self.client.get(url, headers={**self.headers, **kw.pop("headers", {})}, **kw)
+        return self.client.get(
+            url, headers={**self.headers, **kw.pop("headers", {})}, **kw
+        )
 
     def post(self, url, json=None, idem: str | None = None, **kw):
         headers = {**self.headers, **kw.pop("headers", {})}
@@ -112,7 +116,10 @@ class ApiUser:
         return r.json()
 
     def balances(self) -> dict[str, str]:
-        return {w["currency"]: w["balance"] for w in self.get("/api/wallets").json()["wallets"]}
+        return {
+            w["currency"]: w["balance"]
+            for w in self.get("/api/wallets").json()["wallets"]
+        }
 
 
 @pytest.fixture
@@ -121,8 +128,12 @@ def make_user(client):
         email = email or f"user-{uuid.uuid4().hex[:8]}@example.com"
         r = client.post(
             "/api/auth/signup",
-            json={"email": email, "password": "Passw0rd!", "full_name": "Test User",
-                  "default_currency": currency},
+            json={
+                "email": email,
+                "password": "Passw0rd!",
+                "full_name": "Test User",
+                "default_currency": currency,
+            },
         )
         assert r.status_code == 201, r.text
         return ApiUser(client, email, currency, r.json())

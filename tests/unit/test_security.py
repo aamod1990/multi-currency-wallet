@@ -34,8 +34,12 @@ def test_expired_token_rejected():
     s = get_settings()
     past = datetime.now(UTC) - timedelta(hours=2)
     token = jwt.encode(
-        {"sub": str(uuid.uuid4()), "iat": past, "exp": past + timedelta(minutes=1),
-         "typ": "access"},
+        {
+            "sub": str(uuid.uuid4()),
+            "iat": past,
+            "exp": past + timedelta(minutes=1),
+            "typ": "access",
+        },
         s.jwt_secret,
         algorithm=s.jwt_algorithm,
     )

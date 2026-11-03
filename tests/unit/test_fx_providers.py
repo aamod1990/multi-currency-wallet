@@ -32,13 +32,19 @@ def test_open_er_api_parses_and_filters_unknown_currencies(client):
         }
     )
     quote = OpenErApiProvider(client).fetch("USD")
-    assert quote.rates == {"USD": Decimal(1), "EUR": Decimal("0.92"), "INR": Decimal("83.1")}
+    assert quote.rates == {
+        "USD": Decimal(1),
+        "EUR": Decimal("0.92"),
+        "INR": Decimal("83.1"),
+    }
     assert quote.provider_updated_at is not None
 
 
 @respx.mock
 def test_open_er_api_error_result(client):
-    respx.get(OPEN_ER).respond(json={"result": "error", "error-type": "unsupported-code"})
+    respx.get(OPEN_ER).respond(
+        json={"result": "error", "error-type": "unsupported-code"}
+    )
     with pytest.raises(FxProviderError, match="unsupported-code"):
         OpenErApiProvider(client).fetch("USD")
 

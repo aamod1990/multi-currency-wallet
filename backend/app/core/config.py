@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_ttl_minutes: int = 60
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    # Comma-separated; kept as a plain string because pydantic-settings JSON-decodes list fields.
+    cors_origins: str = "http://localhost:5173"
 
     # FX
     fx_provider: Literal["live", "static"] = "live"
@@ -50,12 +51,9 @@ class Settings(BaseSettings):
 
     frontend_dist: str = "/app/frontend_dist"
 
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def _split_origins(cls, v: object) -> object:
-        if isinstance(v, str) and not v.startswith("["):
-            return [o.strip() for o in v.split(",") if o.strip()]
-        return v
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @field_validator("database_url")
     @classmethod

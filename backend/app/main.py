@@ -110,7 +110,7 @@ def create_app(settings: Settings | None = None, *, start_background: bool = Tru
     app.state.error_monitor = monitor
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins,
+        allow_origins=settings.cors_origin_list,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],

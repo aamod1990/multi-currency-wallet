@@ -8,7 +8,10 @@ def _seed(u, other):
     u.credit("100")
     u.credit("50", currency="EUR")
     u.post("/api/wallets/debit", {"amount": "10", "currency": "USD"})
-    u.post("/api/transfers", {"recipient_email": other.email, "amount": "5", "currency": "USD"})
+    u.post(
+        "/api/transfers",
+        {"recipient_email": other.email, "amount": "5", "currency": "USD"},
+    )
 
 
 def test_history_pagination(make_user):
@@ -44,8 +47,10 @@ def test_history_validation(make_user):
     u = make_user()
     assert u.get("/api/transactions", params={"page_size": 1000}).status_code == 422
     assert u.get("/api/transactions", params={"type": "BOGUS"}).status_code == 422
-    r = u.get("/api/transactions", params={
-        "date_from": "2025-02-01T00:00:00Z", "date_to": "2025-01-01T00:00:00Z"})
+    r = u.get(
+        "/api/transactions",
+        params={"date_from": "2025-02-01T00:00:00Z", "date_to": "2025-01-01T00:00:00Z"},
+    )
     assert r.status_code == 422
 
 
@@ -63,7 +68,9 @@ def test_transaction_detail_includes_fx_trace(make_user):
 
 def test_fx_quote_and_currencies(client, make_user):
     u = make_user()
-    q = u.get("/api/fx/quote", params={"amount": "100", "from": "USD", "to": "EUR"}).json()
+    q = u.get(
+        "/api/fx/quote", params={"amount": "100", "from": "USD", "to": "EUR"}
+    ).json()
     assert q["converted_amount"] == "92" and q["snapshot_id"]
     currencies = client.get("/api/fx/currencies").json()
     assert "USD" in currencies and "JPY" in currencies
@@ -110,7 +117,9 @@ def test_metrics_and_request_id(client):
     assert r.json()["error"]["request_id"] == "trace-123"
     assert r.headers["X-Content-Type-Options"] == "nosniff"
     metrics = client.get("/metrics").text
-    assert 'http_requests_total{method="GET",route="/api/users/me",status="401"' in metrics
+    assert (
+        'http_requests_total{method="GET",route="/api/users/me",status="401"' in metrics
+    )
     assert "fx_refresh_total" in metrics
 
 
@@ -129,8 +138,10 @@ def test_unhandled_exception_returns_500_envelope(app, client, monkeypatch):
     monkeypatch.setattr(history_service, "list_entries", boom)
     from fastapi.testclient import TestClient
 
-    r = client.post("/api/auth/signup", json={
-        "email": "z@example.com", "password": "Passw0rd!", "full_name": "Z"})
+    r = client.post(
+        "/api/auth/signup",
+        json={"email": "z@example.com", "password": "Passw0rd!", "full_name": "Z"},
+    )
     headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
     with TestClient(app, raise_server_exceptions=False) as c:
         resp = c.get("/api/transactions", headers=headers)
