@@ -3,7 +3,7 @@
 #                         Prometheus http://localhost:9090, Grafana http://localhost:3000 (admin/admin)
 services:
   mongo:
-    image: public.ecr.aws/docker/library/mongo:7
+    image: ${MONGO_IMAGE:-public.ecr.aws/docker/library/mongo:7}
     # Transactions need a replica set; a single node is enough. The healthcheck
     # initiates it on first boot and then reports readiness.
     command: ["--replSet", "rs0", "--bind_ip_all"]

@@ -29,7 +29,12 @@ jobs:
       # Service containers can't take command args, so start a single-node replica set directly.
       - name: Start MongoDB replica set
         run: |
-          docker run -d --name mongo -p 27017:27017 public.ecr.aws/docker/library/mongo:7 --replSet rs0 --bind_ip_all
+          # Docker Hub first (GitHub runners are not rate-limited there), ECR mirror as fallback.
+          for img in mongo:7 public.ecr.aws/docker/library/mongo:7 mongo:7; do
+            docker pull "$img" && MONGO_IMAGE="$img" && break
+            sleep 5
+          done
+          docker run -d --name mongo -p 27017:27017 "$MONGO_IMAGE" --replSet rs0 --bind_ip_all
           for i in $(seq 1 30); do
             docker exec mongo mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}).ok }" && break
             sleep 2
@@ -69,6 +74,7 @@ jobs:
       - name: Build and start stack (static FX so CI never depends on a third party)
         env:
           FX_PROVIDER: static
+          MONGO_IMAGE: mongo:7
         run: docker compose up -d --build --wait
       - name: Smoke test
         run: ./infra/scripts/smoke_test.sh http://localhost:8000
