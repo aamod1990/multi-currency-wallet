@@ -1,6 +1,0 @@
-pyproject.toml
-wallet_api.egg-info/PKG-INFO
-wallet_api.egg-info/SOURCES.txt
-wallet_api.egg-info/dependency_links.txt
-wallet_api.egg-info/requires.txt
-wallet_api.egg-info/top_level.txt
