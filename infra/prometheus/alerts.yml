@@ -1,0 +1,62 @@
+# Error-rate detection. Ratios (not raw counts) so alerts scale with traffic;
+# `for:` windows suppress one-off blips; minimum-traffic guards stop 1-of-2 requests paging anyone.
+groups:
+  - name: wallet-http-errors
+    rules:
+      - record: wallet:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m]))
+      - record: wallet:http_5xx:ratio5m
+        expr: sum(rate(http_requests_total{status_class="5xx"}[5m])) / clamp_min(wallet:http_requests:rate5m, 1e-9)
+      - record: wallet:http_4xx:ratio5m
+        expr: sum(rate(http_requests_total{status_class="4xx"}[5m])) / clamp_min(wallet:http_requests:rate5m, 1e-9)
+
+      - alert: High5xxErrorRate
+        expr: wallet:http_5xx:ratio5m > 0.05 and wallet:http_requests:rate5m > 0.1
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "5XX ratio {{ $value | humanizePercentage }} over 5m"
+          runbook: "Check /health/ready, recent deploys, logs filtered by level=ERROR and request_id."
+
+      - alert: High4xxErrorRate
+        expr: wallet:http_4xx:ratio5m > 0.30 and wallet:http_requests:rate5m > 0.1
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "4XX ratio {{ $value | humanizePercentage }} over 10m (client breakage or abuse)"
+
+      # Relative spike: 4XX ratio 3x above the same hour yesterday catches regressions
+      # (e.g. a frontend deploy sending bad payloads) even below the absolute threshold.
+      - alert: 4xxRatioSpikeVsBaseline
+        expr: |
+          wallet:http_4xx:ratio5m > 3 * (wallet:http_4xx:ratio5m offset 1d)
+          and wallet:http_4xx:ratio5m > 0.05 and wallet:http_requests:rate5m > 0.1
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "4XX ratio tripled vs. yesterday"
+
+      - alert: AuthFailureBurst
+        expr: sum(rate(auth_events_total{event="login",outcome="failure"}[5m])) > 1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Sustained login failures (possible credential stuffing)"
+
+  - name: wallet-dependencies
+    rules:
+      - alert: ApiDown
+        expr: up{job="wallet-api"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations: { summary: "Wallet API scrape failing" }
+      - alert: FxRatesStale
+        expr: time() - fx_rates_last_success_timestamp_seconds > 2 * 3600
+        for: 10m
+        labels: { severity: ticket }
+        annotations: { summary: "FX rates older than 2h; conversions refuse after FX_MAX_AGE_SECONDS" }
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: { severity: ticket }
+        annotations: { summary: "p95 latency above 1s" }
